@@ -32,6 +32,7 @@
 #include "fbdevhw.h"
 
 #include "xf86xv.h"
+#include "fcntl.h" /* for ioctl O_WRONLY */
 
 #ifdef XSERVER_LIBPCIACCESS
 #include <pciaccess.h>
@@ -66,7 +67,8 @@ static void	FBDevPointerMoved(int index, int x, int y);
 static Bool	FBDevDGAInit(ScrnInfoPtr pScrn, ScreenPtr pScreen);
 static Bool	FBDevDriverFunc(ScrnInfoPtr pScrn, xorgDriverFuncOp op,
 				pointer ptr);
-
+static void FBDevBlockHandler(pointer data, OSTimePtr pTimeout, pointer pRead);
+static void FBDevWakeupHandler(pointer data, int i, pointer LastSelectMask);
 
 enum { FBDEV_ROTATE_NONE=0, FBDEV_ROTATE_CW=270, FBDEV_ROTATE_UD=180, FBDEV_ROTATE_CCW=90 };
 
@@ -124,7 +126,8 @@ typedef enum {
 	OPTION_SHADOW_FB,
 	OPTION_ROTATE,
 	OPTION_FBDEV,
-	OPTION_DEBUG
+	OPTION_DEBUG,
+	OPTION_REPORT_DAMAGE
 } FBDevOpts;
 
 static const OptionInfoRec FBDevOptions[] = {
@@ -132,6 +135,7 @@ static const OptionInfoRec FBDevOptions[] = {
 	{ OPTION_ROTATE,	"Rotate",	OPTV_STRING,	{0},	FALSE },
 	{ OPTION_FBDEV,		"fbdev",	OPTV_STRING,	{0},	FALSE },
 	{ OPTION_DEBUG,		"debug",	OPTV_BOOLEAN,	{0},	FALSE },
+	{ OPTION_REPORT_DAMAGE, "ReportDamage", OPTV_BOOLEAN,   {0},    FALSE },
 	{ -1,			NULL,		OPTV_NONE,	{0},	FALSE }
 };
 
@@ -183,6 +187,7 @@ typedef struct {
 	int				fboff;
 	int				lineLength;
 	int				rotate;
+	Bool                            reportDamage;
 	Bool				shadowFB;
 	void				*shadow;
 	CloseScreenProcPtr		CloseScreen;
@@ -193,6 +198,8 @@ typedef struct {
 	DGAModePtr			pDGAMode;
 	int				nDGAMode;
 	OptionInfoPtr			Options;
+	DamagePtr pDamage;
+	int fd;
 } FBDevRec, *FBDevPtr;
 
 #define FBDEVPTR(p) ((FBDevPtr)((p)->driverPrivate))
@@ -422,8 +429,15 @@ FBDevPreInit(ScrnInfoPtr pScrn, int flags)
 	}
 #endif
 	/* open device */
-	if (!fbdevHWInit(pScrn,NULL,xf86FindOptionValue(fPtr->pEnt->device->options,"fbdev")))
+	if (!fbdevHWInit(pScrn,NULL,xf86FindOptionValue(fPtr->pEnt->device->options,"fbdev"))) {
+		xf86DrvMsg(pScrn->scrnIndex, X_ERROR, "Must specify fbdev option\n");
 		return FALSE;
+	}
+
+	fPtr->fd = open(xf86FindOptionValue(fPtr->pEnt->device->options, "fbdev"),O_WRONLY);
+	if (fPtr->fd < 0)
+		return FALSE;
+
 	default_depth = fbdevHWGetDepth(pScrn,&fbbpp);
 	if (!xf86SetDepthBpp(pScrn, default_depth, default_depth, fbbpp,
 			     Support24bppFb | Support32bppFb | SupportConvert32to24 | SupportConvert24to32))
@@ -478,6 +492,14 @@ FBDevPreInit(ScrnInfoPtr pScrn, int flags)
 
 	/* use shadow framebuffer by default */
 	fPtr->shadowFB = xf86ReturnOptValBool(fPtr->Options, OPTION_SHADOW_FB, TRUE);
+
+	/* pass X damage protocol notifications to framebuffer? */
+	fPtr->reportDamage = xf86ReturnOptValBool(fPtr->Options, OPTION_REPORT_DAMAGE, FALSE);
+
+	if (fPtr->reportDamage && fPtr->shadowFB) {
+		xf86DrvMsg(pScrn->scrnIndex, X_CONFIG, "Damage reporting enabled. Disabling shadow framebuffer\n");
+		fPtr->shadowFB = 0;
+	}
 
 	debug = xf86ReturnOptValBool(fPtr->Options, OPTION_DEBUG, FALSE);
 
@@ -622,10 +644,29 @@ FBDevCreateScreenResources(ScreenPtr pScreen)
 
     pPixmap = pScreen->GetScreenPixmap(pScreen);
 
-    if (!shadowAdd(pScreen, pPixmap, fPtr->rotate ?
+    if (fPtr->reportDamage) {
+	    if (!DamageSetup(pScreen))
+		    return FALSE;
+
+	    fPtr->pDamage = DamageCreate((DamageReportFunc)NULL,
+                                 (DamageDestroyFunc)NULL,
+                                 DamageReportNone,
+                                 TRUE, pScreen, pScreen);
+
+	    if (!RegisterBlockAndWakeupHandlers(FBDevBlockHandler,
+						FBDevWakeupHandler,
+						(pointer)pScreen))
+		    return FALSE;
+
+	    DamageRegister(&pPixmap->drawable, fPtr->pDamage);
+    }
+
+    if (fPtr->shadowFB) {
+	    if (!shadowAdd(pScreen, pPixmap, fPtr->rotate ?
 		   shadowUpdateRotatePackedWeak() : shadowUpdatePackedWeak(),
 		   FBDevWindowLinear, fPtr->rotate, NULL)) {
-	return FALSE;
+		    return FALSE;
+	    }
     }
 
     return TRUE;
@@ -636,8 +677,8 @@ FBDevShadowInit(ScreenPtr pScreen)
 {
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
     FBDevPtr fPtr = FBDEVPTR(pScrn);
-    
-    if (!shadowSetup(pScreen)) {
+
+    if ((fPtr->shadowFB) && (!shadowSetup(pScreen))) {
 	return FALSE;
     }
 
@@ -759,6 +800,8 @@ FBDevScreenInit(int scrnIndex, ScreenPtr pScreen, int argc, char **argv)
 					   pScrn->virtualY, pScrn->xDpi,
 					   pScrn->yDpi, pScrn->displayWidth,
 					   pScrn->bitsPerPixel);
+			if (!ret)
+				xf86DrvMsg(scrnIndex, X_ERROR, "fbScreenInit failed\n");
 			init_picture = 1;
 			break;
 	 	default:
@@ -823,7 +866,7 @@ FBDevScreenInit(int scrnIndex, ScreenPtr pScreen, int argc, char **argv)
 		xf86DrvMsg(pScrn->scrnIndex, X_WARNING,
 			   "Render extension initialisation failed\n");
 
-	if (fPtr->shadowFB && !FBDevShadowInit(pScreen)) {
+	if (!FBDevShadowInit(pScreen)) {
 	    xf86DrvMsg(scrnIndex, X_ERROR,
 		       "shadow framebuffer initialization failed\n");
 	    return FALSE;
@@ -913,11 +956,16 @@ FBDevCloseScreen(int scrnIndex, ScreenPtr pScreen)
 {
 	ScrnInfoPtr pScrn = xf86Screens[scrnIndex];
 	FBDevPtr fPtr = FBDEVPTR(pScrn);
-	
+	PixmapPtr pPixmap;
+
+	pPixmap = pScreen->GetScreenPixmap(pScreen);
+
+	if (fPtr->pDamage)
+		DamageUnregister(&pPixmap->drawable, fPtr->pDamage);
+
 	fbdevHWRestore(pScrn);
 	fbdevHWUnmapVidmem(pScrn);
 	if (fPtr->shadow) {
-	    shadowRemove(pScreen, pScreen->GetScreenPixmap(pScreen));
 	    xfree(fPtr->shadow);
 	    fPtr->shadow = NULL;
 	}
@@ -933,7 +981,85 @@ FBDevCloseScreen(int scrnIndex, ScreenPtr pScreen)
 	return (*pScreen->CloseScreen)(scrnIndex, pScreen);
 }
 
+/***********************************************************************
+ * X DAMAGE handling
+ ***********************************************************************/
 
+/*
+
+Propose new ioctl (pass one rect, or just pass on DamageRegion data?) 
+
+struct fb_rect {
+	uint32_t x;
+	uint32_t y;
+	uint32_t width;
+	uint32_t height;
+};
+#define FBIOPUT_DAMAGE _IOW('F', 0x1A, struct fb_rect)
+
+*/
+
+/* temporarily use old, existing udlfb ioctl */
+struct fb_rect {
+	int x;
+	int y;
+	int width;
+	int height;
+};
+#define FBIOPUT_DAMAGE 0xAA
+
+static void
+FBDevBlockHandler(pointer data, OSTimePtr pTimeout, pointer pRead)
+{
+	ScreenPtr pScreen = (ScreenPtr) data;
+	ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
+        FBDevPtr fPtr = FBDEVPTR(pScrn);
+	RegionPtr pRegion;
+	struct fb_rect damage = {0, 0, 0, 0};
+	int result;
+
+	if (!fPtr->pDamage)
+		return;
+
+	pRegion = DamageRegion(fPtr->pDamage);
+        if (REGION_NOTEMPTY(pScreen, pRegion)) {
+		int         nbox = REGION_NUM_RECTS (pRegion);
+        	BoxPtr      pbox = REGION_RECTS (pRegion);
+
+		damage.x = pScrn->virtualX;
+		damage.y = pScrn->virtualY;
+
+		/* consolidate rects into one, non-duplicative bounding rect.
+		   Opportunity to optimize to tighter set of non-dup rects */
+		while(nbox--) {
+                	if (pbox->x1 < damage.x)
+                        	damage.x = pbox->x1 ;
+
+                	if (pbox->y1 < damage.y)
+                        	damage.y = pbox->y1 ;
+
+                	if ( pbox->x2  > damage.width)
+                        	damage.width = pbox->x2;
+
+                	if ( pbox->y2 > damage.height)
+                        	damage.height = pbox->y2;
+
+                	pbox++;
+        	}
+
+		damage.width = damage.width - damage.x;
+		damage.height = damage.height - damage.y;
+
+        	result = ioctl(fPtr->fd, FBIOPUT_DAMAGE, &damage);
+
+        	DamageEmpty(fPtr->pDamage);
+    	}
+}
+
+static void
+FBDevWakeupHandler(pointer data, int i, pointer LastSelectMask)
+{
+}
 
 /***********************************************************************
  * Shadow stuff
